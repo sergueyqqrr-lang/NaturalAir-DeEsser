@@ -315,7 +315,10 @@ private:
         adapt.updateVoice(ft.refDb, ft.active, ft.s < 0.3f);
         adapt.updateRatio(ft.r, ft.s);
         const float T = adapt.threshold(params.threshold, params.adaptive);
-        ft.Rraw = ft.s * GainComputer::reduction(ft.r, T, params.rangeDb);
+        // Score is only a gate now (0.15..0.55 -> 0..1) instead of a multiplier, so a clearly detected "s"
+        // gets the full reduction instead of s * R (typically 50-70 % of it).
+        const float sGate = ramp(ft.s, 0.15f, 0.55f);
+        ft.Rraw = sGate * GainComputer::reduction(ft.r, T, params.rangeDb);
         dbgRatio.store(ft.r, std::memory_order_relaxed);
         dbgSfm.store(ft.sfm, std::memory_order_relaxed);
         dbgRel.store(ft.sibDb - vdb, std::memory_order_relaxed);
@@ -333,11 +336,11 @@ private:
         for (int j = 0; j <= kLookahead; ++j)
         {
             const FrameFeatures& fj = feats[(size_t) ((sg + j) % kHist)];
-            if (fj.s > 0.5f) ++cnt;
+            if (fj.s > 0.35f) ++cnt;
             evidence = std::max(evidence, fj.s);
-            Rt = std::max(Rt, (1.f - 0.2f * (float) j) * fj.Rraw);
+            Rt = std::max(Rt, (1.f - 0.1f * (float) j) * fj.Rraw);
         }
-        const float confirm = clampf((float) cnt / 3.f, 0.f, 1.f);
+        const float confirm = clampf((float) cnt / 2.f, 0.f, 1.f);
         Rt *= confirm;
 
         tracker.update(ft.centroid, ft.peakHz, ft.s);
