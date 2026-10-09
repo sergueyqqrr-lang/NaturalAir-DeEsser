@@ -95,6 +95,7 @@ public:
         kSpecLo = std::max(2, (int) std::lround(4000.f / binHzL));
         kSpecHi = std::min(nBinsL - 3, (int) std::lround(std::min(16000.f, 0.46f * sr) / binHzL));
         aMask = 1.f - std::exp(-(float) hL / (0.004f * sr));
+        aMaskFall = 1.f - std::exp(-(float) hL / (kMaskHoldMs * 0.001f * sr));
 
         frameRate = sr / (float) hS;
         normPS = 1.f / ((float) nS * (float) nS);
@@ -466,7 +467,10 @@ private:
             peak = std::max(peak, psDb[(size_t) k]);
         }
         // Width also limits how far below the peak a bin may be and still count as sibilance (narrow Width = only the peaks)
-        const float D = lerpf(18.f, 6.f, params.precision) * lerpf(0.6f, 1.f, widthN);
+        // The deeper the cut being asked for, the more of the sibilant's flanks must be inside the mask: a deep cut
+        // that only touches the peak leaves the sides of the "s" audible (extra tolerance up to +kDepthWiden dB).
+        const float depthWiden = kDepthWiden * clampf(reductionDb.load(std::memory_order_relaxed) / 20.f, 0.f, 1.f);
+        const float D = lerpf(18.f, 6.f, params.precision) * lerpf(0.6f, 1.f, widthN) + depthWiden;
         std::fill(maskRaw.begin(), maskRaw.end(), 0.f);
         for (int k = kA; k <= kB; ++k)
             maskRaw[(size_t) k] = ramp(psDb[(size_t) k] - peak, -D - 3.f, -D + 3.f);
@@ -491,12 +495,16 @@ private:
                 const float d = (std::log2(std::max(1.f, (float) k * sr / (float) nL)) - lfcNow) / (2.6f * zoneSigma);
                 target *= std::exp(-0.5f * d * d * d * d);
             }
-            specMask[(size_t) k] += aMask * (target - specMask[(size_t) k]);
+            // Fast "s" fix: the spectrum of a 10-30 ms "s" is noisy, so the target mask jumps from frame to frame and the
+            // flanks of the sibilant kept getting dropped. Rise INSTANTLY to any bin that shows sibilance (union over the event) and
+            // let go slowly, so the whole body of the "s" stays covered for its entire (short) life.
+            specMask[(size_t) k] += (target > specMask[(size_t) k] ? 1.f : aMaskFall) * (target - specMask[(size_t) k]);
         }
     }
 
     // configuration
-    float sr = 48000.f, frameRate = 750.f, normPS = 1.f, normPL = 1.f, aFc = 0.1f, aMask = 0.7f;
+    float sr = 48000.f, frameRate = 750.f, normPS = 1.f, normPL = 1.f, aFc = 0.1f, aMask = 0.7f, aMaskFall = 0.25f;
+    static constexpr float kMaskHoldMs = 20.f, kDepthWiden = 4.f;
     int nCh = 2, nS = 256, hS = 64, nBinsS = 129, nL = 1024, hL = 256, nBinsL = 513, L = 1024;
     int kSpecLo = 8, kSpecHi = 300;
     bool prepared = false;
