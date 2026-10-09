@@ -262,6 +262,10 @@ void NaturalAirEditor::paint(Graphics& g)
     g.drawText("NaturalAir", 18, 10, 120, 28, Justification::centredLeft);
     g.setColour(ui::cyan);
     g.drawText("De-Esser", 112, 10, 120, 28, Justification::centredLeft);
+    // build tag: lets you check at a glance which build your DAW actually loaded (old VST3s are easy to keep by mistake)
+    g.setColour(ui::dim);
+    g.setFont(Font(FontOptions(11.f)));
+    g.drawText("build 20", 200, 10, 80, 28, Justification::centredLeft);
 }
 
 void NaturalAirEditor::resized()
