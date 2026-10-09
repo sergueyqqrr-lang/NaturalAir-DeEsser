@@ -222,7 +222,11 @@ public:
                 up = ringUp[i0] + (ringUp[i1] - ringUp[i0]) * fr;
                 gate = ringGate[i0] + (ringGate[i1] - ringGate[i0]) * fr;
             }
-            const float oneMinusG = R > 1.0e-4f ? 1.f - std::exp(-R * 0.11512925f) : 0.f;
+            // Sibilance gate on the reduction: fully open while an "s" is detected (score >= ~0.1, so the depth on the "s"
+            // is unchanged) and closing within ~10 ms when it ends. Without it the release tail kept subtracting S
+            // from the vowel that follows, and S then holds that vowel's own 5-9 kHz brightness.
+            const float gateOpen = smoothstep(0.f, 0.3f, gate);
+            const float oneMinusG = R > 1.0e-4f ? (1.f - std::exp(-R * 0.11512925f)) * gateOpen : 0.f;
             const float gUpM1 = up > 1.0e-4f ? std::exp(up * 0.11512925f) - 1.f : 0.f;
 
             for (int c = 0; c < nCh; ++c)
