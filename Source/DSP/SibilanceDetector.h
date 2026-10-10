@@ -10,6 +10,8 @@ struct FrameFeatures
     float r = -60.f;          // sibilance/body ratio: max(mean PSD, strongest sub-band - kPeakBiasDb), dB
     float rMean = -60.f;      // ratio of the plain mean over 3.5-11 kHz
     float rPeak = -60.f;      // ratio of the strongest ~1.2 kHz sub-band (a narrow "s" is not diluted by the mean)
+    float sibPeakDb = -200.f; // absolute level of that strongest sub-band, dB
+    float rGain = -60.f;      // ratio used by the REDUCTION law (same peak/sub-band criterion as the detector, lighter bias)
     float sfm = 0.f;          // spectral flatness 3.5-11 kHz
     float centroid = 7000.f;  // Hz
     float peakHz = 7000.f;    // frequency of the strongest sibilance peak (smoothed spectrum)
@@ -60,9 +62,15 @@ public:
                 if (k - kSib0 >= w) acc -= P[k - w];
                 if (k - kSib0 >= w - 1) best = std::max(best, (float) (acc / w));
             }
-            o.rPeak = powToDb(best) - o.refDb;
+            o.sibPeakDb = powToDb(best);
+            o.rPeak = o.sibPeakDb - o.refDb;
         }
         o.r = std::max(o.rMean, o.rPeak - kPeakBiasDb);
+        // Ratio that feeds the gain law. The detector (score) already accepts the strongest sub-band as evidence of an "s";
+        // if the reduction only looked at the diluted mean (or at the peak with the full flat-noise bias) a short/moderate
+        // "s" scored high and then fell below the threshold. The score still gates the result, so hiss cannot gain from the
+        // lighter bias (kPeakBiasGainDb < kPeakBiasDb).
+        o.rGain = std::max(o.rMean, o.rPeak - kPeakBiasGainDb);
 
         double sumLog = 0.0, sumP = 0.0, num = 0.0;
         for (int k = kSib0; k <= kSib1; ++k)
@@ -87,7 +95,9 @@ public:
     }
 
     static constexpr float kGateDb = -80.f;
-    static constexpr float kPeakBiasDb = 6.f;   // expected excess of a sub-band max over the mean for flat noise
+    static constexpr float kPeakBiasDb = 6.f;   // expected excess of a sub-band max over the mean for flat noise (detector)
+    static constexpr float kPeakBiasGainDb = 4.f;   // same, for the reduction ratio (score already gates it)
+    static constexpr float kPeakBiasLevelDb = 5.f;  // same, for the level cue (rel) of the score
 
 private:
     int N = 512, nBins = 257;
@@ -102,7 +112,9 @@ struct SibilanceDetector
     static float score(const FrameFeatures& f, float voiceDb)
     {
         if (!f.active) return 0.f;
-        const float rel = f.sibDb - voiceDb;
+        // Level of the sibilance vs. the vowel: the mean over 3.5-11 kHz dilutes a narrow "s", so the strongest sub-band
+        // (minus a small noise bias) counts too. Same peak criterion as rPeak, so sR and sL no longer disagree.
+        const float rel = std::max(f.sibDb, f.sibPeakDb - FeatureExtractor::kPeakBiasLevelDb) - voiceDb;
         // Calibrated on labelled speech (see Tools/process_wav): real "s" sounds have a peaky
         // spectrum (flatness ~0.15-0.25) and a level that varies a lot against the vowel
         // reference, so the flatness cue stays loose; the level cue is what rejects breaths and room noise.
