@@ -10,6 +10,7 @@ class AdaptiveThreshold
 public:
     static constexpr int kBins = 64;
     static constexpr float kLo = -24.f, kHi = 12.f;
+    static constexpr float kNudgeUpDb = 1.5f, kNudgeDownDb = 4.f;
 
     void prepare(float frameRateHz)
     {
@@ -80,7 +81,10 @@ public:
     {
         const float base = lerpf(16.f, -26.f, sens);   // spans the typical sibilance ratios over the full travel
         if (!adaptive) return base;
-        const float off = clampf(0.35f * percentile(0.5f), -4.f, 4.f);
+        // Asymmetric nudge: a hot singer may LOWER the threshold by up to 4 dB, but loud "s" sounds can only raise it by
+        // 1.5 dB. The histogram is fed with the strong sounds (score > 0.6); letting it push T up by 4 dB used to leave
+        // the moderate, real "s" sounds (ratio 6-10 dB under the strong ones) below the threshold.
+        const float off = clampf(0.35f * percentile(0.5f), -kNudgeDownDb, kNudgeUpDb);
         return clampf(base + off, -30.f, 20.f);
     }
 
