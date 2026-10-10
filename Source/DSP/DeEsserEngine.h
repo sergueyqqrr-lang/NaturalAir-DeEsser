@@ -264,6 +264,7 @@ public:
     float getDebugSfm() const { return dbgSfm.load(std::memory_order_relaxed); }
     float getDebugRelDb() const { return dbgRel.load(std::memory_order_relaxed); }
     float getDebugThresholdDb() const { return dbgThr.load(std::memory_order_relaxed); }
+    float getDebugRawReductionDb() const { return dbgRaw.load(std::memory_order_relaxed); }   // target before confirm/envelope
     float consumeInputPeak() { return peakInM.exchange(0.f, std::memory_order_relaxed); }
     float consumeOutputPeak() { return peakOutM.exchange(0.f, std::memory_order_relaxed); }
     float getGainCurveDb(int p) const { return gainMeter[(size_t) p].load(std::memory_order_relaxed); }
@@ -320,13 +321,18 @@ private:
         const float vdb = adapt.voiceDb(ft.refDb);
         ft.s = SibilanceDetector::score(ft, vdb);
         adapt.updateVoice(ft.refDb, ft.active, ft.s < 0.3f);
-        adapt.updateRatio(ft.r, ft.s);
+        // The histogram and the threshold live in the same ratio the gain law compares against (rGain).
+        adapt.updateRatio(ft.rGain, ft.s);
         const float T = adapt.threshold(params.threshold, params.adaptive);
         // Score is only a gate now (0.15..0.55 -> 0..1) instead of a multiplier, so a clearly detected "s"
         // gets the full reduction instead of s * R (typically 50-70 % of it).
         const float sGate = ramp(ft.s, 0.20f, 0.50f);
-        ft.Rraw = sGate * GainComputer::reduction(ft.r, T, params.rangeDb);
-        dbgRatio.store(ft.r, std::memory_order_relaxed);
+        // Evidence: what the detector is sure about is passed on to the law (lower effective T, wider knee), so a high
+        // score cannot end in R = 0 just because the ratio sits a few dB under the threshold.
+        const float sEvidence = ramp(ft.s, 0.40f, 0.80f);
+        ft.Rraw = sGate * GainComputer::reduction(ft.rGain, T, params.rangeDb, sEvidence);
+        dbgRatio.store(ft.rGain, std::memory_order_relaxed);
+        dbgRaw.store(ft.Rraw, std::memory_order_relaxed);
         dbgSfm.store(ft.sfm, std::memory_order_relaxed);
         dbgRel.store(ft.sibDb - vdb, std::memory_order_relaxed);
         dbgScore.store(ft.s, std::memory_order_relaxed);
@@ -534,7 +540,7 @@ private:
     // meters
     std::array<int, kMeterPoints> meterBin {};
     std::array<std::atomic<float>, kMeterPoints> gainMeter {}, specMeter {};
-    std::atomic<float> dbgSfm { 0.f }, dbgRel { 0.f }, dbgRatio { 0.f }, dbgScore { 0.f }, dbgThr { 0.f };
+    std::atomic<float> dbgSfm { 0.f }, dbgRel { 0.f }, dbgRatio { 0.f }, dbgScore { 0.f }, dbgThr { 0.f }, dbgRaw { 0.f };
     std::atomic<float> reductionDb { 0.f }, fcMeter { 7000.f }, peakInM { 0.f }, peakOutM { 0.f };
 };
 
