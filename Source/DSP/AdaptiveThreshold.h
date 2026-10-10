@@ -11,6 +11,7 @@ public:
     static constexpr int kBins = 64;
     static constexpr float kLo = -24.f, kHi = 12.f;
     static constexpr float kNudgeUpDb = 1.5f, kNudgeDownDb = 4.f;
+    static constexpr float kBaseMaxDb = 16.f, kBaseMidDb = -5.f, kBaseMinDb = -12.f;   // T at 0 % / 50 % / 100 %
 
     void prepare(float frameRateHz)
     {
@@ -79,7 +80,13 @@ public:
     // "s" sounds instead of drifting up until nothing is processed.
     float threshold(float sens, bool adaptive) const
     {
-        const float base = lerpf(16.f, -26.f, sens);   // spans the typical sibilance ratios over the full travel
+        // The knob must keep doing something over its WHOLE travel. Real sibilance ratios sit between roughly -14 and +12 dB:
+        // once T falls below the weakest "s" the score gate decides everything and more sensitivity changes nothing
+        // (it used to be linear down to -26 dB, so the last ~35 % of the knob was dead). The lower half keeps its slope
+        // (50 % is still -5 dB, so the default is unchanged); the upper half is compressed onto the useful range.
+        const float s01 = clampf(sens, 0.f, 1.f);
+        const float base = s01 <= 0.5f ? lerpf(kBaseMaxDb, kBaseMidDb, s01 * 2.f)
+                                       : lerpf(kBaseMidDb, kBaseMinDb, (s01 - 0.5f) * 2.f);
         if (!adaptive) return base;
         // Asymmetric nudge: a hot singer may LOWER the threshold by up to 4 dB, but loud "s" sounds can only raise it by
         // 1.5 dB. The histogram is fed with the strong sounds (score > 0.6); letting it push T up by 4 dB used to leave
