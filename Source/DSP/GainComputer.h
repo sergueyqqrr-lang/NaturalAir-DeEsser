@@ -16,17 +16,25 @@ struct GainComputer
     static constexpr float kRangeGain = 1.0f;      // Range = dB of cut at the core of the sibilant
     static constexpr float kFloorRatioDb = -30.f;
 
-    static float softKnee(float x)
+    // How much a high detector score may lower the effective threshold (dB) and widen the knee (dB): the detector and the
+    // reduction law have to agree. A frame the detector is sure about must not sit in the dead zone of the law, so the
+    // gain curve degrades gradually (continuously) below the threshold instead of dropping to 0.
+    static constexpr float kEvidenceRelaxDb = 5.f;
+    static constexpr float kEvidenceKneeDb = 8.f;
+
+    static float softKnee(float x, float W = kKneeDb)
     {
-        const float W = kKneeDb;
         if (2.f * x < -W) return 0.f;
         if (2.f * std::fabs(x) <= W) { const float t = x + W * 0.5f; return t * t / (2.f * W); }
         return x;
     }
 
-    static float reduction(float ratioDb, float thresholdDb, float rangeDb)
+    // evidence: 0..1, how sure the detector is (0 = no extra help: the original law).
+    static float reduction(float ratioDb, float thresholdDb, float rangeDb, float evidence = 0.f)
     {
-        const float u = clampf(softKnee(ratioDb - thresholdDb) / kFullExcessDb, 0.f, 1.f);
+        const float e = clampf(evidence, 0.f, 1.f);
+        const float x = ratioDb - (thresholdDb - kEvidenceRelaxDb * e);
+        const float u = clampf(softKnee(x, kKneeDb + kEvidenceKneeDb * e) / kFullExcessDb, 0.f, 1.f);
         float R = kRangeGain * rangeDb * u * (2.f - u);
         // the natural floor relaxes when Range is high, so a pure "s" can still be taken (almost) out on request
         const float floorDb = kFloorRatioDb - 0.75f * std::max(0.f, rangeDb - 16.f);
