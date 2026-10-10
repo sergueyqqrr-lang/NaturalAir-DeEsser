@@ -1,0 +1,169 @@
+diff -ruN a/Source/DSP/AdaptiveThreshold.h b/Source/DSP/AdaptiveThreshold.h
+--- a/Source/DSP/AdaptiveThreshold.h	2026-10-10 20:12:36.122878364 +0000
++++ b/Source/DSP/AdaptiveThreshold.h	2026-10-10 20:15:08.873036206 +0000
+@@ -10,6 +10,7 @@
+ public:
+     static constexpr int kBins = 64;
+     static constexpr float kLo = -24.f, kHi = 12.f;
++    static constexpr float kNudgeUpDb = 1.5f, kNudgeDownDb = 4.f;
+ 
+     void prepare(float frameRateHz)
+     {
+@@ -80,7 +81,10 @@
+     {
+         const float base = lerpf(16.f, -26.f, sens);   // spans the typical sibilance ratios over the full travel
+         if (!adaptive) return base;
+-        const float off = clampf(0.35f * percentile(0.5f), -4.f, 4.f);
++        // Asymmetric nudge: a hot singer may LOWER the threshold by up to 4 dB, but loud "s" sounds can only raise it by
++        // 1.5 dB. The histogram is fed with the strong sounds (score > 0.6); letting it push T up by 4 dB used to leave
++        // the moderate, real "s" sounds (ratio 6-10 dB under the strong ones) below the threshold.
++        const float off = clampf(0.35f * percentile(0.5f), -kNudgeDownDb, kNudgeUpDb);
+         return clampf(base + off, -30.f, 20.f);
+     }
+ 
+diff -ruN a/Source/DSP/DeEsserEngine.h b/Source/DSP/DeEsserEngine.h
+--- a/Source/DSP/DeEsserEngine.h	2026-10-10 20:12:36.122924029 +0000
++++ b/Source/DSP/DeEsserEngine.h	2026-10-10 20:15:19.721881861 +0000
+@@ -264,6 +264,7 @@
+     float getDebugSfm() const { return dbgSfm.load(std::memory_order_relaxed); }
+     float getDebugRelDb() const { return dbgRel.load(std::memory_order_relaxed); }
+     float getDebugThresholdDb() const { return dbgThr.load(std::memory_order_relaxed); }
++    float getDebugRawReductionDb() const { return dbgRaw.load(std::memory_order_relaxed); }   // target before confirm/envelope
+     float consumeInputPeak() { return peakInM.exchange(0.f, std::memory_order_relaxed); }
+     float consumeOutputPeak() { return peakOutM.exchange(0.f, std::memory_order_relaxed); }
+     float getGainCurveDb(int p) const { return gainMeter[(size_t) p].load(std::memory_order_relaxed); }
+@@ -320,13 +321,18 @@
+         const float vdb = adapt.voiceDb(ft.refDb);
+         ft.s = SibilanceDetector::score(ft, vdb);
+         adapt.updateVoice(ft.refDb, ft.active, ft.s < 0.3f);
+-        adapt.updateRatio(ft.r, ft.s);
++        // The histogram and the threshold live in the same ratio the gain law compares against (rGain).
++        adapt.updateRatio(ft.rGain, ft.s);
+         const float T = adapt.threshold(params.threshold, params.adaptive);
+         // Score is only a gate now (0.15..0.55 -> 0..1) instead of a multiplier, so a clearly detected "s"
+         // gets the full reduction instead of s * R (typically 50-70 % of it).
+         const float sGate = ramp(ft.s, 0.20f, 0.50f);
+-        ft.Rraw = sGate * GainComputer::reduction(ft.r, T, params.rangeDb);
+-        dbgRatio.store(ft.r, std::memory_order_relaxed);
++        // Evidence: what the detector is sure about is passed on to the law (lower effective T, wider knee), so a high
++        // score cannot end in R = 0 just because the ratio sits a few dB under the threshold.
++        const float sEvidence = ramp(ft.s, 0.40f, 0.80f);
++        ft.Rraw = sGate * GainComputer::reduction(ft.rGain, T, params.rangeDb, sEvidence);
++        dbgRatio.store(ft.rGain, std::memory_order_relaxed);
++        dbgRaw.store(ft.Rraw, std::memory_order_relaxed);
+         dbgSfm.store(ft.sfm, std::memory_order_relaxed);
+         dbgRel.store(ft.sibDb - vdb, std::memory_order_relaxed);
+         dbgScore.store(ft.s, std::memory_order_relaxed);
+@@ -534,7 +540,7 @@
+     // meters
+     std::array<int, kMeterPoints> meterBin {};
+     std::array<std::atomic<float>, kMeterPoints> gainMeter {}, specMeter {};
+-    std::atomic<float> dbgSfm { 0.f }, dbgRel { 0.f }, dbgRatio { 0.f }, dbgScore { 0.f }, dbgThr { 0.f };
++    std::atomic<float> dbgSfm { 0.f }, dbgRel { 0.f }, dbgRatio { 0.f }, dbgScore { 0.f }, dbgThr { 0.f }, dbgRaw { 0.f };
+     std::atomic<float> reductionDb { 0.f }, fcMeter { 7000.f }, peakInM { 0.f }, peakOutM { 0.f };
+ };
+ 
+diff -ruN a/Source/DSP/GainComputer.h b/Source/DSP/GainComputer.h
+--- a/Source/DSP/GainComputer.h	2026-10-10 20:12:36.122888427 +0000
++++ b/Source/DSP/GainComputer.h	2026-10-10 20:15:08.873452736 +0000
+@@ -16,17 +16,25 @@
+     static constexpr float kRangeGain = 1.0f;      // Range = dB of cut at the core of the sibilant
+     static constexpr float kFloorRatioDb = -30.f;
+ 
+-    static float softKnee(float x)
++    // How much a high detector score may lower the effective threshold (dB) and widen the knee (dB): the detector and the
++    // reduction law have to agree. A frame the detector is sure about must not sit in the dead zone of the law, so the
++    // gain curve degrades gradually (continuously) below the threshold instead of dropping to 0.
++    static constexpr float kEvidenceRelaxDb = 5.f;
++    static constexpr float kEvidenceKneeDb = 8.f;
++
++    static float softKnee(float x, float W = kKneeDb)
+     {
+-        const float W = kKneeDb;
+         if (2.f * x < -W) return 0.f;
+         if (2.f * std::fabs(x) <= W) { const float t = x + W * 0.5f; return t * t / (2.f * W); }
+         return x;
+     }
+ 
+-    static float reduction(float ratioDb, float thresholdDb, float rangeDb)
++    // evidence: 0..1, how sure the detector is (0 = no extra help: the original law).
++    static float reduction(float ratioDb, float thresholdDb, float rangeDb, float evidence = 0.f)
+     {
+-        const float u = clampf(softKnee(ratioDb - thresholdDb) / kFullExcessDb, 0.f, 1.f);
++        const float e = clampf(evidence, 0.f, 1.f);
++        const float x = ratioDb - (thresholdDb - kEvidenceRelaxDb * e);
++        const float u = clampf(softKnee(x, kKneeDb + kEvidenceKneeDb * e) / kFullExcessDb, 0.f, 1.f);
+         float R = kRangeGain * rangeDb * u * (2.f - u);
+         // the natural floor relaxes when Range is high, so a pure "s" can still be taken (almost) out on request
+         const float floorDb = kFloorRatioDb - 0.75f * std::max(0.f, rangeDb - 16.f);
+diff -ruN a/Source/DSP/SibilanceDetector.h b/Source/DSP/SibilanceDetector.h
+--- a/Source/DSP/SibilanceDetector.h	2026-10-10 20:12:36.122914435 +0000
++++ b/Source/DSP/SibilanceDetector.h	2026-10-10 20:16:36.405881409 +0000
+@@ -10,6 +10,8 @@
+     float r = -60.f;          // sibilance/body ratio: max(mean PSD, strongest sub-band - kPeakBiasDb), dB
+     float rMean = -60.f;      // ratio of the plain mean over 3.5-11 kHz
+     float rPeak = -60.f;      // ratio of the strongest ~1.2 kHz sub-band (a narrow "s" is not diluted by the mean)
++    float sibPeakDb = -200.f; // absolute level of that strongest sub-band, dB
++    float rGain = -60.f;      // ratio used by the REDUCTION law (same peak/sub-band criterion as the detector, lighter bias)
+     float sfm = 0.f;          // spectral flatness 3.5-11 kHz
+     float centroid = 7000.f;  // Hz
+     float peakHz = 7000.f;    // frequency of the strongest sibilance peak (smoothed spectrum)
+@@ -60,9 +62,15 @@
+                 if (k - kSib0 >= w) acc -= P[k - w];
+                 if (k - kSib0 >= w - 1) best = std::max(best, (float) (acc / w));
+             }
+-            o.rPeak = powToDb(best) - o.refDb;
++            o.sibPeakDb = powToDb(best);
++            o.rPeak = o.sibPeakDb - o.refDb;
+         }
+         o.r = std::max(o.rMean, o.rPeak - kPeakBiasDb);
++        // Ratio that feeds the gain law. The detector (score) already accepts the strongest sub-band as evidence of an "s";
++        // if the reduction only looked at the diluted mean (or at the peak with the full flat-noise bias) a short/moderate
++        // "s" scored high and then fell below the threshold. The score still gates the result, so hiss cannot gain from the
++        // lighter bias (kPeakBiasGainDb < kPeakBiasDb).
++        o.rGain = std::max(o.rMean, o.rPeak - kPeakBiasGainDb);
+ 
+         double sumLog = 0.0, sumP = 0.0, num = 0.0;
+         for (int k = kSib0; k <= kSib1; ++k)
+@@ -87,7 +95,9 @@
+     }
+ 
+     static constexpr float kGateDb = -80.f;
+-    static constexpr float kPeakBiasDb = 6.f;   // expected excess of a sub-band max over the mean for flat noise
++    static constexpr float kPeakBiasDb = 6.f;   // expected excess of a sub-band max over the mean for flat noise (detector)
++    static constexpr float kPeakBiasGainDb = 4.f;   // same, for the reduction ratio (score already gates it)
++    static constexpr float kPeakBiasLevelDb = 5.f;  // same, for the level cue (rel) of the score
+ 
+ private:
+     int N = 512, nBins = 257;
+@@ -102,7 +112,9 @@
+     static float score(const FrameFeatures& f, float voiceDb)
+     {
+         if (!f.active) return 0.f;
+-        const float rel = f.sibDb - voiceDb;
++        // Level of the sibilance vs. the vowel: the mean over 3.5-11 kHz dilutes a narrow "s", so the strongest sub-band
++        // (minus a small noise bias) counts too. Same peak criterion as rPeak, so sR and sL no longer disagree.
++        const float rel = std::max(f.sibDb, f.sibPeakDb - FeatureExtractor::kPeakBiasLevelDb) - voiceDb;
+         // Calibrated on labelled speech (see Tools/process_wav): real "s" sounds have a peaky
+         // spectrum (flatness ~0.15-0.25) and a level that varies a lot against the vowel
+         // reference, so the flatness cue stays loose; the level cue is what rejects breaths and room noise.
+--- a/Tools/process_wav.cpp	2026-10-10 20:12:36.122815587 +0000
++++ b/Tools/process_wav.cpp	2026-10-10 20:14:45.068344436 +0000
+@@ -79,7 +79,7 @@
+     for (int c = 0; c < in.ch; ++c) for (int i = 0; i < L; ++i) out.d[(size_t) c][n + (size_t) i] = 0.f;
+     std::vector<float*> ptr((size_t) in.ch);
+     std::FILE* csv = csvPath ? std::fopen(csvPath, "w") : nullptr;
+-    if (csv) std::fprintf(csv, "t,ratioDb,thresholdDb,score,reductionDb,fcHz,sfm,relDb\n");
++    if (csv) std::fprintf(csv, "t,ratioDb,thresholdDb,score,reductionDb,fcHz,sfm,relDb,rawDb\n");
+     float maxR = 0; double sumR = 0; size_t blocks = 0, active = 0;
+     for (size_t pos = 0; pos < n + (size_t) L; pos += 128)
+     {
+@@ -87,7 +87,7 @@
+         for (int c = 0; c < in.ch; ++c) ptr[(size_t) c] = out.d[(size_t) c].data() + pos;
+         e->process(ptr.data(), (int) m);
+         const float R = e->getReductionDb(); maxR = std::max(maxR, R); sumR += R; ++blocks; if (R > 0.5f) ++active;
+-        if (csv) std::fprintf(csv, "%.4f,%.2f,%.2f,%.3f,%.2f,%.0f,%.3f,%.1f\n", pos / (double) in.sr, e->getDebugRatioDb(), e->getDebugThresholdDb(), e->getDebugScore(), R, e->getFrequencyHz(), e->getDebugSfm(), e->getDebugRelDb());
++        if (csv) std::fprintf(csv, "%.4f,%.2f,%.2f,%.3f,%.2f,%.0f,%.3f,%.1f,%.2f\n", pos / (double) in.sr, e->getDebugRatioDb(), e->getDebugThresholdDb(), e->getDebugScore(), R, e->getFrequencyHz(), e->getDebugSfm(), e->getDebugRelDb(), e->getDebugRawReductionDb());
+     }
+     if (csv) std::fclose(csv);
+     // remove latency
