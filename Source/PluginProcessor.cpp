@@ -12,7 +12,7 @@ AudioProcessorValueTreeState::ParameterLayout NaturalAirProcessor::createLayout(
                                                      AudioParameterFloatAttributes().withLabel(unit));
     };
     p.push_back(F("airKeep",   "Air Keep",  { 0.f, 100.f, 0.1f }, 65.f, "%"));
-    p.push_back(F("threshold", "Threshold", { 0.f, 100.f, 0.1f }, 50.f, "%"));
+    p.push_back(F("threshold", "Threshold", { 0.f, 100.f, 0.1f }, 65.f, "%"));
     p.push_back(F("range",     "Range",     { 0.f, 40.f, 0.1f },  16.f, "dB"));
     p.push_back(F("precision", "Precision", { 0.f, 100.f, 0.1f }, 75.f, "%"));
     p.push_back(F("width",     "Width",     { 0.10f, 0.70f, 0.01f }, 0.25f, "oct"));
@@ -24,7 +24,7 @@ AudioProcessorValueTreeState::ParameterLayout NaturalAirProcessor::createLayout(
         r.setSkewForCentre(centre);
         return r;
     };
-    p.push_back(F("attack",  "Attack",  logRange(0.01f, 200.f, 0.01f, 1.5f),   0.5f, "ms"));
+    p.push_back(F("attack",  "Attack",  logRange(0.01f, 200.f, 0.01f, 1.5f),   0.2f, "ms"));
     p.push_back(F("release", "Release", logRange(0.5f, 3000.f, 0.1f, 60.f),   50.f, "ms"));
     p.push_back(F("airBoost",  "Air Boost", { 0.f, 3.f, 0.1f },   0.f,  "dB"));
     p.push_back(F("mix",       "Mix",       { 0.f, 100.f, 0.1f }, 100.f, "%"));
