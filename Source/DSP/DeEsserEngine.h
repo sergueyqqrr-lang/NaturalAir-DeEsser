@@ -18,7 +18,7 @@ namespace naturalair {
 struct Params
 {
     float airKeep = 0.65f;    // 0..1
-    float threshold = 0.5f;   // 0..1 sensitivity (1 = more sensitive)
+    float threshold = 0.65f;  // 0..1 sensitivity (1 = more sensitive)
     float rangeDb = 12.f;     // max reduction at the centre of the sibilant (0..40)
     float precision = 0.75f;  // 0 = smooth zone, 1 = only the exact frequencies where the "s" has energy
     float widthOct = 0.40f;   // width (sigma, octaves) of the smooth zone (0.1..2)
