@@ -79,7 +79,7 @@ int main(int argc, char** argv)
     for (int c = 0; c < in.ch; ++c) for (int i = 0; i < L; ++i) out.d[(size_t) c][n + (size_t) i] = 0.f;
     std::vector<float*> ptr((size_t) in.ch);
     std::FILE* csv = csvPath ? std::fopen(csvPath, "w") : nullptr;
-    if (csv) std::fprintf(csv, "t,ratioDb,thresholdDb,score,reductionDb,fcHz,sfm,relDb\n");
+    if (csv) std::fprintf(csv, "t,ratioDb,thresholdDb,score,reductionDb,fcHz,sfm,relDb,rawDb\n");
     float maxR = 0; double sumR = 0; size_t blocks = 0, active = 0;
     for (size_t pos = 0; pos < n + (size_t) L; pos += 128)
     {
@@ -87,7 +87,7 @@ int main(int argc, char** argv)
         for (int c = 0; c < in.ch; ++c) ptr[(size_t) c] = out.d[(size_t) c].data() + pos;
         e->process(ptr.data(), (int) m);
         const float R = e->getReductionDb(); maxR = std::max(maxR, R); sumR += R; ++blocks; if (R > 0.5f) ++active;
-        if (csv) std::fprintf(csv, "%.4f,%.2f,%.2f,%.3f,%.2f,%.0f,%.3f,%.1f\n", pos / (double) in.sr, e->getDebugRatioDb(), e->getDebugThresholdDb(), e->getDebugScore(), R, e->getFrequencyHz(), e->getDebugSfm(), e->getDebugRelDb());
+        if (csv) std::fprintf(csv, "%.4f,%.2f,%.2f,%.3f,%.2f,%.0f,%.3f,%.1f,%.2f\n", pos / (double) in.sr, e->getDebugRatioDb(), e->getDebugThresholdDb(), e->getDebugScore(), R, e->getFrequencyHz(), e->getDebugSfm(), e->getDebugRelDb(), e->getDebugRawReductionDb());
     }
     if (csv) std::fclose(csv);
     // remove latency
