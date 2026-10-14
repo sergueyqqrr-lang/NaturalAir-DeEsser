@@ -85,7 +85,20 @@ public:
             const float v = P[k - 1] + 2.f * P[k] + P[k + 1];
             if (v > best) { best = v; kBest = k; }
         }
-        o.peakHz = (float) kBest * binHz;
+        // The raw bin is only +-47 Hz.. +-94 Hz and jumps between neighbours on a noisy "s": take the centre of mass of the top of the
+        // hump around it (power above 20 % of the peak, +-550 Hz). Still local (never the whole 3.5-11 kHz band), but stable and sub-bin.
+        {
+            const int hw = std::max(1, (int) std::lround(550.f / binHz));
+            const int a = std::max(1, kBest - hw), b = std::min(nBins - 2, kBest + hw);
+            const float floorP = 0.2f * std::max(P[kBest], 1e-30f);
+            double nn = 0.0, dd = 0.0;
+            for (int k = a; k <= b; ++k)
+            {
+                const double w = std::max(0.f, P[k] - floorP);
+                nn += w * (double) k; dd += w;
+            }
+            o.peakHz = dd > 0.0 ? (float) (nn / dd) * binHz : (float) kBest * binHz;
+        }
 
         o.lowFluxDb = first ? 0.f : o.lowDb - prevLowDb;
         prevLowDb = o.lowDb; first = false;
