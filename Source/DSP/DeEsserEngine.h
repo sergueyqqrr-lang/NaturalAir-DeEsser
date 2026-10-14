@@ -89,7 +89,7 @@ public:
         PS.assign((size_t) nBinsS, 0.f);
         PL.assign((size_t) nBinsL, 0.f);
         maskCurve.assign((size_t) nBinsL, 0.f);
-        for (auto* v : { &psDb, &maskRaw, &maskPre, &specMask }) v->assign((size_t) nBinsL + 1, 0.f);
+        for (auto* v : { &psDb, &psWide, &maskRaw, &maskPre, &specMask }) v->assign((size_t) nBinsL + 1, 0.f);
 
         const float binHzL = sr / (float) nL;
         kSpecLo = std::max(2, (int) std::lround(4000.f / binHzL));
@@ -140,10 +140,11 @@ public:
             ch.hp.reset();
         }
         for (auto& f : feats) f = FrameFeatures {};
-        holdVal = 0.f; holdCnt = 0; ringR.fill(0.f); ringUp.fill(0.f); ringGate.fill(0.f); ringFc.fill(7000.f);
+        holdVal = 0.f; holdCnt = 0; ringR.fill(0.f); ringUp.fill(0.f); ringGate.fill(0.f); ringEv.fill(0.f); ringFc.fill(7000.f);
         adapt.reset(); tracker.reset(); env.reset();
         extractor.prepare(sr, nS);
         lfcS = std::log2(7000.f);
+        lfcFine = std::log2(7000.f); fineLive = false;
         std::fill(specMask.begin(), specMask.end(), 0.f);
         airBoostS.snap(0.f); activityS.snap(0.f); presenceS.snap(0.f); gateS.snap(0.f);
         inGainS.snap(inGainT); outGainS.snap(outGainT); mixS.snap(mixT);
@@ -363,12 +364,14 @@ private:
 
         tracker.update(ft.centroid, ft.peakHz, ft.s);
         const float fcTarget = params.freqAuto ? tracker.frequency() : params.freqHz;
-        lfcS += (std::log2(std::max(fcTarget, 1000.f)) - lfcS) * (tracker.inEventNow() ? aFcEvent : aFc);
+        // fc follows the tracker almost frame by frame while there is sibilance (event or clear evidence);
+        // the slower smoother only acts between sibilants (no jitter on the idle value)
+        lfcS += (std::log2(std::max(fcTarget, 1000.f)) - lfcS) * ((tracker.inEventNow() || evidence > 0.30f) ? aFcEvent : aFc);
         const float fc = std::exp2(lfcS);
 
         const float R = std::min(env.process(Rt, evidence), guardMaxR);
         reductionDb.store(R, std::memory_order_relaxed);
-        fcMeter.store(fc, std::memory_order_relaxed);
+        if (!fineLive) fcMeter.store(fc, std::memory_order_relaxed);   // while the fine path locks onto the "s" it owns the meter
 
         const float activity = activityS.process(fg.active ? 1.f : 0.f);
         const float presence = presenceS.process(ramp(fg.airDb - fg.refDb, -55.f, -42.f));
@@ -384,6 +387,7 @@ private:
         const float gTarget = clampf(3.f * std::max(fg.s, f1.s), 0.f, 1.f);
         ringGate[r] = std::max(gTarget, gateS.process(gTarget));
         ringFc[r] = fc;
+        ringEv[r] = evidence;
     }
 
     // FINE path: exact spectral mask (WHERE) -> sibilant component S(t) by overlap-add.
@@ -409,9 +413,12 @@ private:
 
         // frequency tracked at the centre of this long frame
         const uint64_t centre = start + (uint64_t) (nL / 2) - (uint64_t) (nS / 2);
-        const float fc = ringFc[(size_t) ((centre / (uint64_t) hS) & (uint64_t) (kRing - 1))];
+        const size_t ri = (size_t) ((centre / (uint64_t) hS) & (uint64_t) (kRing - 1));
+        const float fcCoarse = ringFc[ri];
 
-        computeSpecMask(fc);
+        // WHERE exactly: the fine spectrum re-estimates the centre (and a possible second hump) of THIS "s"; the coarse
+        // tracker value is only the prior. The mask and the zone are then built around that centre.
+        const float fc = computeSpecMask(fcCoarse, ringEv[ri]);   // centre the zone (bell, 0.65 x fc floor, air start) is built around
         const float* spec = params.precision > 0.001f ? specMask.data() : nullptr;
         if (params.listen == 2) zone.buildDetector(maskCurve.data(), fc, ak, spec, params.precision);
         else                    zone.buildMask(maskCurve.data(), fc, ak, spec, params.precision);
@@ -453,10 +460,14 @@ private:
 
     // Per-bin mask of WHERE this sibilant has energy, on the fine (47 Hz) spectrum: bins within D dB of
     // the strongest sibilance peak (two humps, e.g. "sh" + "s", are both caught; valleys are left alone).
-    void computeSpecMask(float fc)
+    // Returns the centre the mask/zone must be built around: with Auto Frequency the fine-spectrum peak of this "s"
+    // (the coarse tracker value is only a prior), otherwise fcIn unchanged.
+    // With two humps the zone centre is their geometric mean (so the 0.65 x fc body floor cannot cut the lower hump),
+    // while the Frequency meter shows the stronger one.
+    float computeSpecMask(float fcIn, float evidence)
     {
         const int kA = kSpecLo, kB = kSpecHi;
-        const float lfcNow = std::log2(std::max(fc, 1000.f)), zoneSigma = ak.sigmaOct;
+        const float zoneSigma = ak.sigmaOct;
         float peak = -1.0e9f;
         maskPre[0] = 0.f;
         for (int k = 0; k < nBinsL; ++k) maskPre[(size_t) k + 1] = maskPre[(size_t) k] + PL[(size_t) k];
@@ -474,12 +485,88 @@ private:
         // that only touches the peak leaves the sides of the "s" audible (extra tolerance up to +kDepthWiden dB).
         const float depthWiden = kDepthWiden * clampf(reductionDb.load(std::memory_order_relaxed) / 20.f, 0.f, 1.f);
         const float D = lerpf(18.f, 6.f, params.precision) * lerpf(0.6f, 1.f, widthN) + depthWiden;
+
+        // ---- centre of THIS "s" on the fine spectrum (Auto Frequency only) ----
+        const float lfcIn = std::log2(std::max(fcIn, 1000.f));
+        float lfcMain = lfcIn, lfc2 = 0.f;
+        bool has2 = false;
+        if (params.freqAuto)
+        {
+            const float wFine = ramp(evidence, 0.15f, 0.40f);
+            if (wFine > 0.f)
+            {
+                // strongest hump; a weak prior around the coarse centre (6 dB per (0.7 oct)^2, max 12 dB) only keeps a vowel
+                // formant far away from beating the real "s"
+                const float binOct = std::log2(sr / (float) nL);
+                // The periodogram of a noisy "s" has random dips and spikes of +-5 dB; its raw maximum lands anywhere on the hump.
+                // Search the hump on a wider average (+-0.12 oct, maskPre still holds the cumulative power) and only then
+                // take the centre of mass of that hump.
+                int kp = kA; float bestScore = -1.0e9f;
+                for (int k = kA; k <= kB; ++k)
+                {
+                    const int h = std::max(1, (int) std::lround(0.083f * (float) k));
+                    const int lo = std::max(0, k - h), hi = std::min(nBinsL - 1, k + h);
+                    psWide[(size_t) k] = powToDb((maskPre[(size_t) hi + 1] - maskPre[(size_t) lo]) / (float) (hi - lo + 1));
+                    const float d = (std::log2((float) k) + binOct - lfcIn) / 0.7f;
+                    // hysteresis: the hump we are already on keeps +3 dB, so two equal humps do not make the centre flip every frame
+                    const float stick = (fineLive && std::fabs(std::log2((float) k) + binOct - lfcFine) < 0.15f) ? 3.f : 0.f;
+                    const float sc = psWide[(size_t) k] - std::min(12.f, 6.f * d * d) + stick;
+                    if (sc > bestScore) { bestScore = sc; kp = k; }
+                }
+                auto humpCentre = [&](int k0) -> float
+                {
+                    // centre of mass (log-frequency) of the part of the hump within 4 dB of its top, at most +-0.3 oct
+                    const float lim = psWide[(size_t) k0] - 4.f;
+                    const int kLim = std::max(1, (int) std::lround(0.23f * (float) k0));
+                    int lo = k0, hi = k0;
+                    while (lo > kA && k0 - lo < kLim && psWide[(size_t) (lo - 1)] >= lim) --lo;
+                    while (hi < kB && hi - k0 < kLim && psWide[(size_t) (hi + 1)] >= lim) ++hi;
+                    double nn = 0.0, dd = 0.0;
+                    for (int k = lo; k <= hi; ++k) { nn += (double) PL[(size_t) k] * (double) std::log2((float) k); dd += (double) PL[(size_t) k]; }
+                    return dd > 0.0 ? (float) (nn / dd) + binOct : (std::log2((float) k0) + binOct);
+                };
+                const float lPeak = humpCentre(kp);
+                // snap on a different colour, fast follow otherwise (the fine window already smears ~20 ms)
+                const float dv = std::fabs(lPeak - lfcFine);
+                const float a = dv > 0.25f ? 1.f : (dv > 0.12f ? 0.7f : 0.4f);
+                lfcFine += (lPeak - lfcFine) * a;
+                lfcMain = lerpf(lfcIn, lfcFine, wFine);
+                fineLive = wFine > 0.5f;
+
+                // second hump ("s" + "sh"): comparable strength, clearly apart from the main one, not near the body
+                if (params.precision > 0.5f)
+                {
+                    int k2 = -1; float best2 = -1.0e9f;
+                    for (int k = kA + 1; k < kB; ++k)
+                    {
+                        const float dOct = std::fabs(std::log2((float) k) + binOct - lfcFine);
+                        if (dOct < 0.30f || dOct > 1.0f) continue;
+                        const float v = psWide[(size_t) k];
+                        if (v >= psWide[(size_t) (k - 1)] && v >= psWide[(size_t) (k + 1)] && v > best2) { best2 = v; k2 = k; }
+                    }
+                    if (k2 > 0 && best2 > psWide[(size_t) kp] - std::min(10.f, D + 3.f))
+                    {
+                        // a REAL second hump needs a valley between the two (>= 4 dB below the weaker top); a bump on the flank of the
+                        // main hump is not one
+                        float valley = 1.0e9f;
+                        for (int k = std::min(kp, k2); k <= std::max(kp, k2); ++k) valley = std::min(valley, psWide[(size_t) k]);
+                        if (valley < std::min(psWide[(size_t) kp], best2) - 4.f) { has2 = true; lfc2 = humpCentre(k2); }
+                    }
+                }
+            }
+            else { lfcFine = lfcIn; fineLive = false; }
+            if (fineLive) fcMeter.store(std::exp2(lfcMain), std::memory_order_relaxed);
+        }
+        else fineLive = false;
+
         std::fill(maskRaw.begin(), maskRaw.end(), 0.f);
         for (int k = kA; k <= kB; ++k)
             maskRaw[(size_t) k] = ramp(psDb[(size_t) k] - peak, -D - 3.f, -D + 3.f);
 
         // light blur in log-frequency; Width controls how much (0.03 .. 0.12 octaves)
         const float sigmaB = 0.02f + 0.06f * widthN;   // edge blur of the peaks: 0.02..0.08 oct
+        const float w2 = has2 ? ramp(params.precision, 0.5f, 0.8f) : 0.f;
+        const float binOctS = std::log2(sr / (float) nL);
         maskPre[0] = 0.f;
         for (int k = 0; k < nBinsL; ++k) maskPre[(size_t) k + 1] = maskPre[(size_t) k] + maskRaw[(size_t) k];
         for (int k = 0; k < nBinsL; ++k)
@@ -491,18 +578,27 @@ private:
                 const int lo = std::max(kA, k - h), hi = std::min(kB, k + h);
                 target = (maskPre[(size_t) hi + 1] - maskPre[(size_t) lo]) / (float) (hi - lo + 1);
             }
-            // support window: the spectral mask can never reach far from the tracked frequency (2.6 sigma),
-            // so a narrow Width really removes the bins away from the "s" instead of only blurring them
+            // support window: the spectral mask can never reach far from the centre of the "s" (2.6 sigma),
+            // so a narrow Width really removes the bins away from the "s" instead of only blurring them.
+            // The centre is now the one measured on the fine spectrum; a second hump gets its own window.
             if (target > 0.f)
             {
-                const float d = (std::log2(std::max(1.f, (float) k * sr / (float) nL)) - lfcNow) / (2.6f * zoneSigma);
-                target *= std::exp(-0.5f * d * d * d * d);
+                const float lk = std::log2(std::max(1.f, (float) k)) + binOctS;
+                const float d = (lk - lfcMain) / (2.6f * zoneSigma);
+                float sup = std::exp(-0.5f * d * d * d * d);
+                if (w2 > 0.f)
+                {
+                    const float d2 = (lk - lfc2) / (2.6f * zoneSigma);
+                    sup = std::max(sup, w2 * std::exp(-0.5f * d2 * d2 * d2 * d2));
+                }
+                target *= sup;
             }
             // Fast "s" fix: the spectrum of a 10-30 ms "s" is noisy, so the target mask jumps from frame to frame and the
             // flanks of the sibilant kept getting dropped. Rise INSTANTLY to any bin that shows sibilance (union over the event) and
             // let go slowly, so the whole body of the "s" stays covered for its entire (short) life.
             specMask[(size_t) k] += (target > specMask[(size_t) k] ? 1.f : aMaskFall) * (target - specMask[(size_t) k]);
         }
+        return std::exp2(has2 ? 0.5f * (lfcMain + lfc2) : lfcMain);
     }
 
     // configuration
@@ -512,7 +608,7 @@ private:
     // lookahead frames (it used to start at 60 % and gain 10 % per frame), a short or weak "s" keeps more of its depth
     // (confirmation floor 0.6 -> 0.85) and the score gate opens earlier (0.20..0.50 -> 0.14..0.40).
     static constexpr float kLookaheadDerate = 0.025f, kConfirmFloor = 0.85f, kGateLo = 0.14f, kGateHi = 0.40f;
-    static constexpr float kFcEventSmoothMs = 1.0f;
+    static constexpr float kFcEventSmoothMs = 0.5f;
     int nCh = 2, nS = 256, hS = 64, nBinsS = 129, nL = 1024, hL = 256, nBinsL = 513, L = 1024;
     int kSpecLo = 8, kSpecHi = 300;
     bool prepared = false;
@@ -523,16 +619,17 @@ private:
     float lastAttack = -1.f, lastRelease = -1.f;
     float inGainT = 1.f, outGainT = 1.f, mixT = 1.f, bypassT = 0.f, deltaT = 0.f;
     OnePole inGainS, outGainS, mixS, bypassS, deltaS, airBoostS, activityS, presenceS, gateS;
-    float lfcS = 12.77f;
+    float lfcS = 12.77f, lfcFine = 12.77f;
+    bool fineLive = false;   // the fine path currently owns the Frequency meter
 
     // state
     uint64_t nIn = 0, inMask = 0, outMask = 0;
     Fft fftS, fftL;
     std::vector<float> windowS, windowL, workRe, workIm, PS, PL, maskCurve;
-    std::vector<float> psDb, maskRaw, maskPre, specMask;
+    std::vector<float> psDb, psWide, maskRaw, maskPre, specMask;
     std::array<Chan, kMaxChannels> chan;
     std::array<FrameFeatures, kHist> feats;
-    std::array<float, kRing> ringR {}, ringUp {}, ringGate {}, ringFc {};
+    std::array<float, kRing> ringR {}, ringUp {}, ringGate {}, ringEv {}, ringFc {};
     FeatureExtractor extractor;
     AdaptiveThreshold adapt;
     FrequencyTracker tracker;
